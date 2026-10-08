@@ -29,6 +29,19 @@ const readMcpEvidence = runRoot => readFileSync(join(runRoot, 'events.jsonl'), '
     event.payload.message.startsWith('mcp-evidence: '))
   .map(event => JSON.parse(event.payload.message.slice('mcp-evidence: '.length)));
 let now = new Date('2026-10-08T00:00:00.000Z');
+let searchCycle = 0;
+let activeSearchCycle = 0;
+const rotatingSyntheticProvider = async ({ cursor }) => {
+  if (cursor === null) activeSearchCycle = ++searchCycle;
+  const page = await syntheticColdSearchProvider({ cursor });
+  if (page.kind !== 'page') return page;
+  return { ...page, sourceRevision: `cold-search-provider-demo-r${activeSearchCycle}`,
+    items: page.items.map(item => {
+      const sourceId = Number(item.candidateRef.slice(-3));
+      const candidateRef = `candidate_search_demo_${String(100 + activeSearchCycle * 10 + sourceId).padStart(3, '0')}`;
+      return { ...item, candidateRef };
+    }) };
+};
 const scheduleRequest = async (_profileId, requestedVacancyId) => requestedVacancyId === vacancyId ? ({
   vacancyId, criteriaRevision: 'criteria-search-demo-r1',
   criteria: { keywords: ['synthetic candidate'], regions: ['region_demo_001'] }
@@ -39,7 +52,7 @@ const server = createRecruitingServer({
   resolveCurrentSearchCriteriaRevision: () => 'criteria-search-demo-r1',
   resolveScheduledSearchRequest: scheduleRequest,
   scheduleClock: () => new Date(now),
-  candidateSearchProvider: syntheticColdSearchProvider
+  candidateSearchProvider: rotatingSyntheticProvider
 });
 let runner;
 try {
@@ -125,10 +138,18 @@ try {
   now = new Date(scheduled.schedules[0].nextRunAt);
   const tick = await server.coldSearchSchedules.tick('sandbox-scheduled-worker');
   assert.deepEqual(tick, { claimed: 1, completed: 1, unknown: 0 });
+  const afterFirstOccurrence = await (await fetch(`${site}/api/hh/proactive/candidates?vacancy_id=${vacancyId}`, { headers: auth })).json();
+  assert.equal(afterFirstOccurrence.total, 3);
+  assert.ok(afterFirstOccurrence.candidates.every(item => item.isNew === true));
+
+  const nextSchedule = await (await fetch(`${site}/api/hh/proactive/schedule?vacancy_id=${vacancyId}`, { headers: auth })).json();
+  now = new Date(nextSchedule.schedules[0].nextRunAt);
+  const secondTick = await server.coldSearchSchedules.tick('sandbox-scheduled-worker');
+  assert.deepEqual(secondTick, { claimed: 1, completed: 1, unknown: 0 });
   const occurrences = await invokeAgent({ tool: tools[1], arguments: { vacancyId } });
-  assert.equal(occurrences.occurrences.length, 1);
-  assert.equal(occurrences.occurrences[0].status, 'succeeded');
-  assert.equal(occurrences.occurrences[0].snapshot.resultCount, 3);
+  assert.equal(occurrences.occurrences.length, 2);
+  assert.ok(occurrences.occurrences.every(item => item.status === 'succeeded'));
+  assert.ok(occurrences.occurrences.every(item => item.snapshot.resultCount === 3));
   const deniedProfile = await invokeAgent(null, 'profile_demo_002', [
     { tool: tools[1], arguments: { vacancyId } }
   ]);
@@ -145,9 +166,11 @@ try {
   assert.match(pageScript, /candidatesNode\.append\(row\)/);
   const feed = await (await fetch(`${site}/api/hh/proactive/candidates?vacancy_id=${vacancyId}`, { headers: auth })).json();
   assert.equal(feed.status, 'completed');
-  assert.ok(feed.total > 0);
+  assert.equal(feed.total, 6);
+  assert.equal(feed.candidates.filter(item => item.isNew === true).length, 3);
+  assert.equal(feed.candidates.filter(item => item.isNew === false).length, 3);
   assert.equal(feed.source, 'scheduled');
-  assert.ok(feed.candidates.every(item => item.candidateRef && item.title && item.isNew === true));
+  assert.ok(feed.candidates.every(item => item.candidateRef && item.title && typeof item.isNew === 'boolean'));
   const surfaces = agentRuns.flatMap(({ receipt, cwd, evidenceText }) => [
     ...['events.jsonl', 'state.json', 'result.json'].map(name => readFileSync(join(workDir, 'runs', receipt.runId, name), 'utf8')),
     evidenceText
@@ -157,7 +180,8 @@ try {
   process.stdout.write(`${JSON.stringify({ outcome: 'pass', runner: 'FakeEngine over Agent Runner MCP bridge',
     siteTransport: 'local Recruiting HTTP server', profileId, tools, schedule: scheduled.schedules[0].enabled,
     page: pageResponse.status, browserRenderContract: 'candidate title/NEW/region rendered from candidate feed',
-    schedulerTick: tick, freshCandidates: feed.total, source: feed.source,
+    schedulerTicks: [tick, secondTick], freshCandidates: feed.candidates.filter(item => item.isNew).length,
+    accumulatedCandidates: feed.total, source: feed.source,
     crossProfileMcpCall: 'refused' })}\n`);
 } finally {
   runner?.dispose();
